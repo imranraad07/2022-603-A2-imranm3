@@ -51,11 +51,11 @@ __global__ void KNN(float * train, float * test, int * predictions, float * cand
 
     int queryIndex = threadIdx.x + blockIdx.x * blockDim.x;
 
-    // candidates array should also be impleted used shared space. TODO: think about it. 
-
     if (queryIndex < test_size) {
         // Stores k-NN candidates for a query vector as a sorted 2d array. First element is inner product, second is class.
 
+        // access the candidates for the current query item by shifting query_idx times
+        // Alternative: candidates array should also be impleted used shared space. TODO: think about it. 
         int candidate_cuda_idx_buffer = queryIndex * 2 * k;
 
         for (int keyIndex = 0; keyIndex < train_size; keyIndex ++) {
