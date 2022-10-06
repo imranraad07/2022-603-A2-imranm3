@@ -21,7 +21,7 @@ using namespace std;
 
 // https://stackoverflow.com/questions/41050300/how-do-i-allocate-memory-and-copy-2d-arrays-between-cpu-gpu-in-cuda-without-fl
 
-const int array_width = 50;
+const int array_width = 20;
 
 typedef float my_arr[array_width];
 
@@ -48,7 +48,7 @@ typedef float my_arr[array_width];
 // }
 
 
-__global__ void KNN(my_arr * firstArray, my_arr * secondArray, int * predictions, float * candidates, int * classCounts, int train_size, int test_size, int k, int num_attributes, int num_classes) {
+__global__ void KNN(my_arr * firstArray, my_arr * secondArray, int * predictions, my_arr * candidates, my_arr * classCounts, int train_size, int test_size, int k, int num_attributes, int num_classes) {
     int column = blockIdx.x * blockDim.x + threadIdx.x;
     int row = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -69,17 +69,17 @@ __global__ void KNN(my_arr * firstArray, my_arr * secondArray, int * predictions
 
         // Add to our candidates
         for(int c = 0; c < k; c++){
-            if(dist < candidates[row*2*k + 2*c]){
+            if(dist < candidates[row][2*c]){
                 // Found a new candidate
                 // Shift previous candidates down by one
                 for(int x = k-2; x >= c; x--) {
-                    candidates[row*2*k + 2*x+2] = candidates[row*2*k + 2*x];
-                    candidates[row*2*k + 2*x+3] = candidates[row*2*k + 2*x+1];
+                    candidates[row][2*x+2] = candidates[row][2*x];
+                    candidates[row][2*x+3] = candidates[row][2*x+1];
                 }
                 
                 // Set key vector as potential k NN
-                candidates[row*2*k + 2*c] = dist;
-                candidates[row*2*k + 2*c+1] = firstArray[keyIndex][num_attributes - 1]; // class value
+                candidates[row][2*c] = dist;
+                candidates[row][2*c+1] = firstArray[keyIndex][num_attributes - 1]; // class value
 
                 // printf("%d %d ", keyIndex, (int)firstArray[keyIndex][num_attributes - 1]);
 
@@ -89,15 +89,15 @@ __global__ void KNN(my_arr * firstArray, my_arr * secondArray, int * predictions
     }
 
     for(int i = 0; i < k;i++){
-        classCounts[row * num_classes + (int)candidates[row*2*k + 2*i+1]] += 1;
+        classCounts[row][(int)candidates[row][2*i+1]] += 1;
     }
     
     int max = -1;
     int max_index = 0;
     for(int i = 0; i < num_classes;i++){
-        if(classCounts[row * num_classes + i] > max){
-            max = classCounts[row * num_classes + i];
-            max_index = i;
+        if((int) classCounts[row][i] > max){
+            max = (int) classCounts[row][i];
+            max_index = (int) i;
         }
     }
 
@@ -258,15 +258,22 @@ int main(int argc, char * argv[]) {
     // }
 
     int rows_train = train_size, rows_test = test_size, columns = array_width;
-    my_arr * h_firstArray, * h_secondArray;
-    my_arr * d_firstArray, * d_secondArray;
+    my_arr * h_firstArray, * h_secondArray, *h_candidates, *h_class_counts;
+    my_arr * d_firstArray, * d_secondArray, *d_candidates, *d_class_counts;
     size_t dsize_train = rows_train * columns * sizeof(float);
     size_t dsize_test = rows_test * columns * sizeof(float);
+    size_t dsize_candidates = rows_test * columns * sizeof(float);
+    size_t dsize_class_count = rows_test * columns * sizeof(float);
     h_firstArray = (my_arr * ) malloc(dsize_train);
     h_secondArray = (my_arr * ) malloc(dsize_test);
+    h_candidates = (my_arr * ) malloc(dsize_candidates);
+    h_class_counts = (my_arr * ) malloc(dsize_class_count);
+
     // populate h_ arrays
     memset(h_firstArray, 0, dsize_train);
     memset(h_secondArray, 0, dsize_test);
+    memset(h_candidates, 0, dsize_candidates);
+    memset(h_class_counts, 0, dsize_class_count);
 
     for (int i = 0; i < train_size; i++) {
         for (int j = 0; j < num_attributes; j++) {
@@ -281,12 +288,22 @@ int main(int argc, char * argv[]) {
         }
     }
 
+    for (int i = 0; i < test_size; i++) {
+        for (int j = 0; j < columns; j++) {
+            h_candidates[i][j] = FLT_MAX;
+        }
+    }
+
     // Allocate memory on device
     cudaMalloc( & d_firstArray, dsize_train);
     cudaMalloc( & d_secondArray, dsize_test);
+    cudaMalloc( & d_candidates, dsize_candidates);
+    cudaMalloc( & d_class_counts, dsize_class_count);
     // Do memcopies to GPU
     cudaMemcpy(d_firstArray, h_firstArray, dsize_train, cudaMemcpyHostToDevice);
     cudaMemcpy(d_secondArray, h_secondArray, dsize_test, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_candidates, h_candidates, dsize_candidates, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_class_counts, h_class_counts, dsize_class_count, cudaMemcpyHostToDevice);
 
 
 
@@ -294,25 +311,25 @@ int main(int argc, char * argv[]) {
     int * h_predictions = (int * ) malloc(test_size * sizeof(int));
 
     // Stores k-NN candidates for a query vector as a sorted 2d array. First element is inner product, second is class.
-    float * h_candidates = (float * ) calloc(test_size * k * 2, sizeof(float));
-    for (int i = 0; i < test_size * 2 * k; i++) {
-        h_candidates[i] = FLT_MAX;
-    }
+    // float * h_candidates = (float * ) calloc(test_size * k * 2, sizeof(float));
+    // for (int i = 0; i < test_size * 2 * k; i++) {
+        // h_candidates[i] = FLT_MAX;
+    // }
     // Stores bincounts of each class over the final set of candidate NN
-    int * h_class_counts = (int * ) calloc(test_size * num_classes, sizeof(int));
+    // int * h_class_counts = (int * ) calloc(test_size * num_classes, sizeof(int));
 
     // Allocate device memory
     // float * d_train_instances;
     // float * d_test_instances;
     int * d_predictions;
-    float * d_candidates;
-    int * d_class_counts;
+    // float * d_candidates;
+    // int * d_class_counts;
 
     // cudaMalloc( & d_train_instances, train_size * num_attributes * sizeof(float));
     // cudaMalloc( & d_test_instances, test_size * num_attributes * sizeof(float));
     cudaMalloc( & d_predictions, test_size * sizeof(int));
-    cudaMalloc( & d_candidates, test_size * k * 2 * sizeof(float));
-    cudaMalloc( & d_class_counts, test_size * num_classes * sizeof(int));
+    // cudaMalloc( & d_candidates, test_size * k * 2 * sizeof(float));
+    // cudaMalloc( & d_class_counts, test_size * num_classes * sizeof(int));
 
     // cuda timing: https://developer.nvidia.com/blog/how-implement-performance-metrics-cuda-cc/
     cudaEvent_t start, stop;
@@ -324,8 +341,8 @@ int main(int argc, char * argv[]) {
     // cudaMemcpy(d_train_instances, h_train_instances, train_size * num_attributes * sizeof(float), cudaMemcpyHostToDevice);
     // cudaMemcpy(d_test_instances, h_test_instances, test_size * num_attributes * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_predictions, h_predictions, test_size * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_candidates, h_candidates, test_size * k * 2 * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_class_counts, h_class_counts, test_size * num_classes * sizeof(float), cudaMemcpyHostToDevice);
+    // cudaMemcpy(d_candidates, h_candidates, test_size * k * 2 * sizeof(float), cudaMemcpyHostToDevice);
+    // cudaMemcpy(d_class_counts, h_class_counts, test_size * num_classes * sizeof(float), cudaMemcpyHostToDevice);
 
     // Configure the block and grid sizes
     // int blocksPerGrid = (test_size + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
