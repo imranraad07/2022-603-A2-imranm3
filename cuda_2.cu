@@ -21,7 +21,7 @@ using namespace std;
 
 // https://stackoverflow.com/questions/41050300/how-do-i-allocate-memory-and-copy-2d-arrays-between-cpu-gpu-in-cuda-without-fl
 
-const int array_width = 20;
+const int array_width = 12;
 
 typedef float my_arr[array_width];
 
@@ -52,6 +52,8 @@ __global__ void KNN(my_arr * firstArray, my_arr * secondArray, int * predictions
     int column = blockIdx.x * blockDim.x + threadIdx.x;
     int row = blockIdx.y * blockDim.y + threadIdx.y;
 
+    // printf("%d %d\n", row, column);
+
     if (row >= test_size || column > 0)
         return;
 
@@ -59,10 +61,11 @@ __global__ void KNN(my_arr * firstArray, my_arr * secondArray, int * predictions
 
         float dist = 0;
         for(int j = 0; j < num_attributes - 1; j++){
-            dist += (firstArray[keyIndex][j] - secondArray[row][j])*(firstArray[keyIndex][j] - secondArray[row][j]);
+            float x = (firstArray[keyIndex][j] - secondArray[row][j]);
+            dist += x * x;
         }
-        // distance calculation OK
         // printf("%d %d %.2f\n", row, keyIndex, dist);
+        // distance calculation OK
 
         // TODO: fix rest 
         // seems working
@@ -132,79 +135,6 @@ float computeAccuracy(int * confusionMatrix, ArffData * dataset) {
 
 
 
-
-// int main(int argc, char * argv[]) {
-
-//     if (argc != 4) {
-//         cout << "Usage: ./main datasets/trainfile.arff datasets/testfile.arff k" << endl;
-//         exit(0);
-//     }
-
-//     int k = strtol(argv[3], NULL, 10);
-
-//     // Open the datasets
-//     ArffParser parserTrain(argv[1]);
-//     ArffParser parserTest(argv[2]);
-//     ArffData * train = parserTrain.parse();
-//     ArffData * test = parserTest.parse();
-
-//     int num_attributes = train -> num_attributes();
-//     int num_classes = train -> num_classes();
-//     int train_size = (int) train -> num_instances();
-//     int test_size = (int) test -> num_instances();
-
-//     int rows_train = train_size, rows_test = test_size, columns = array_width;
-//     my_arr * h_firstArray, * h_secondArray;
-//     my_arr * d_firstArray, * d_secondArray;
-//     size_t dsize_train = rows_train * columns * sizeof(float);
-//     size_t dsize_test = rows_test * columns * sizeof(float);
-//     h_firstArray = (my_arr * ) malloc(dsize_train);
-//     h_secondArray = (my_arr * ) malloc(dsize_test);
-//     // populate h_ arrays
-//     memset(h_firstArray, 0, dsize_train);
-//     memset(h_secondArray, 0, dsize_test);
-
-//     for (int i = 0; i < train_size; i++) {
-//         for (int j = 0; j < num_attributes; j++) {
-//             h_firstArray[i][j] = train -> get_instance(i) -> get(j) -> operator float();
-//         }
-//     }
-
-//     for (int i = 0; i < test_size; i++) {
-//         for (int j = 0; j < num_attributes; j++) {
-//             h_secondArray[i][j] = test -> get_instance(i) -> get(j) -> operator float();
-//         }
-//     }
-
-//     // Allocate memory on device
-//     cudaMalloc( & d_firstArray, dsize_train);
-//     cudaMalloc( & d_secondArray, dsize_test);
-//     // Do memcopies to GPU
-//     cudaMemcpy(d_firstArray, h_firstArray, dsize_train, cudaMemcpyHostToDevice);
-//     cudaMemcpy(d_secondArray, h_secondArray, dsize_test, cudaMemcpyHostToDevice);
-
-//     dim3 block(32, 32);
-//     dim3 grid((columns + block.x - 1) / block.x, (rows_test + block.y - 1) / block.y);
-//     myKernel << < grid, block >>> (d_firstArray, d_secondArray, rows_train, rows_test, columns);
-
-//     // Do memcopies back to host
-//     cudaMemcpy(h_firstArray, d_firstArray, dsize_train, cudaMemcpyDeviceToHost);
-//     cudaMemcpy(h_secondArray, d_secondArray, dsize_test, cudaMemcpyDeviceToHost);
-//     // validate
-//     if (cudaGetLastError() != cudaSuccess) {
-//         printf("cuda error\n");
-//         return -1;
-//     }
-//     printf("success!\n");
-
-//     cudaFree(d_firstArray);
-//     cudaFree(d_secondArray);
-
-//     free(h_firstArray);
-//     free(h_secondArray);
-
-//     return 0;
-// }
 
 int main(int argc, char * argv[]) {
     if (argc != 4) {
