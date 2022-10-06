@@ -15,7 +15,7 @@
 #define __shared__
 #endif
 
-#define THREADS_PER_BLOCK 128
+// #define THREADS_PER_BLOCK 128
 
 using namespace std;
 
