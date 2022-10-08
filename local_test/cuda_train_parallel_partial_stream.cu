@@ -15,78 +15,65 @@
 #define __shared__
 #endif
 
-#define THREADS_PER_BLOCK 128
 
 using namespace std;
 
-// float distance_cpu(ArffInstance* a, ArffInstance* b) {
-//     float sum = 0;
-    
-//     // iterate through all of the attributes (except the last one, which is the class label)
-//     for (int i = 0; i < a->size()-1; i++) {
-//         float diff = (a->get(i)->operator float() - b->get(i)->operator float());
-//         sum += diff*diff;
-//     }
-    
-//     return sum;
-// }
 
+// help: https://docs.nvidia.com/cuda/pdf/CUDA_C_Programming_Guide.pdf
 
-__device__ float distance(float * a, int idx_a, float * b, int idx_b, int size) {
+__device__ float distance(float * a, int idx_a, int idx_b, int size) {
     float sum = 0;
 
     for (int i = 0; i < size - 1; i++) {
-        float diff = * (a + idx_a + i) - * (b +  idx_b + i);
+        float diff = * (a + idx_a + i) - * (a +  idx_b + i);
         sum += diff * diff;
     }
 
     return sum;
 }
 
-// help: https://docs.nvidia.com/cuda/pdf/CUDA_C_Programming_Guide.pdf
 
-
-__global__ void KNN(float * train, float * test, int * predictions, float * candidates, int * classCounts, int train_size, int test_size, int k, int num_attributes, int num_classes, int stream, int numberElementsPerStream) {
+__global__ void KNN(float * test, int * predictions, float * candidates, int * classCounts, int train_size, int test_size, int k, int num_attributes, int num_classes, int stream, int numberElementsPerStream) {
     // Implements a sequential kNN where for each candidate query an in-place priority queue is maintained to identify the kNN's.
 
-    // int queryIndex = threadIdx.x + blockIdx.x * blockDim.x;
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int queryIndex = stream * numberElementsPerStream + tid;
+// key = ID of training point
+// query = ID of test point
+    int queryIndex = stream * numberElementsPerStream + blockIdx.x * blockDim.x + threadIdx.x; 
+    int keyIndex = stream * numberElementsPerStream + blockIdx.y * blockDim.y + threadIdx.y; 
 
-    if (queryIndex < test_size) {
-        if (predictions[queryIndex] != INT_MAX){
-            return;
-        }
-        // Stores k-NN candidates for a query vector as a sorted 2d array. First element is inner product, second is class.
+    // printf("queryIndex: %d keyIndex: %d bidx: %d bidy: %d tidx: %d tidy: %d \n", queryIndex, keyIndex, blockIdx.x ,  blockIdx.y , threadIdx.x, threadIdx.y);
 
-        // access the candidates for the current query item by shifting query_idx times
-        // Alternative: candidates array should also be impleted used shared space. TODO: think about it. 
+    if (queryIndex < test_size && keyIndex < train_size) {
+
         int candidate_cuda_idx_buffer = queryIndex * 2 * k;
+        float dist = distance(test, queryIndex * num_attributes, num_attributes * test_size + keyIndex * num_attributes, num_attributes);
 
-        for (int keyIndex = 0; keyIndex < train_size; keyIndex ++) {
+        __syncthreads();
 
-            int train_key_index = keyIndex * num_attributes;
-            float dist = distance(test, queryIndex * num_attributes, train, train_key_index, num_attributes);
-            // printf("train idx: %d, test idx: %d, dist: %lf\n", keyIndex, queryIndex, dist);
-
-            // Add to our candidates
-            for (int c = 0; c < k; c++) {
-                if (dist < candidates[candidate_cuda_idx_buffer + 2 * c]) {
-                    // Found a new candidate
-                    // Shift previous candidates down by one
-                    for (int x = k - 2; x >= c; x--) {
-                        candidates[candidate_cuda_idx_buffer + 2 * x + 2] = candidates[candidate_cuda_idx_buffer + 2 * x];
-                        candidates[candidate_cuda_idx_buffer + 2 * x + 3] = candidates[candidate_cuda_idx_buffer + 2 * x + 1];
-                    }
-
-                    // Set key vector as potential k NN
-                    candidates[candidate_cuda_idx_buffer + 2 * c] = dist;
-                    candidates[candidate_cuda_idx_buffer + 2 * c + 1] = train[train_key_index + num_attributes - 1]; // class value
-
-                    break;
+        // Add to our candidates
+        for (int c = 0; c < k; c++) {
+            if (dist < candidates[candidate_cuda_idx_buffer + 2 * c]) {
+                // Found a new candidate
+                // Shift previous candidates down by one
+                for (int x = k - 2; x >= c; x--) {
+                    candidates[candidate_cuda_idx_buffer + 2 * x + 2] = candidates[candidate_cuda_idx_buffer + 2 * x];
+                    candidates[candidate_cuda_idx_buffer + 2 * x + 3] = candidates[candidate_cuda_idx_buffer + 2 * x + 1];
                 }
+                // Set key vector as potential k NN
+                candidates[candidate_cuda_idx_buffer + 2 * c] = dist;
+                candidates[candidate_cuda_idx_buffer + 2 * c + 1] = test[num_attributes * test_size + keyIndex * num_attributes + num_attributes - 1]; // class value
+                break;
             }
         }
+    }
+}
+
+__global__ void KNN2(int * predictions, float * candidates, int * classCounts, int test_size, int k, int num_classes) {
+    // Implements a sequential kNN where for each candidate query an in-place priority queue is maintained to identify the kNN's.
+    int queryIndex = blockIdx.x * blockDim.x + threadIdx.x; // ID of test point
+    if (queryIndex < test_size) {
+        __syncthreads();
+        int candidate_cuda_idx_buffer = queryIndex * 2 * k;
 
         int cuda_idx_buffer = queryIndex * num_classes;
 
@@ -103,14 +90,10 @@ __global__ void KNN(float * train, float * test, int * predictions, float * cand
                 max_index = i;
             }
         }
-
         predictions[queryIndex] = max_index;
-        printf("%d %d -- ", queryIndex, max_index);
-
-        // for(int i = 0; i < 2*k; i++){ candidates[i] = FLT_MAX; }
-        // memset(classCounts, 0, num_classes * sizeof(int));
     }
 }
+
 
 int * computeConfusionMatrix(int * predictions, ArffData * dataset) {
     int * confusionMatrix = (int * ) calloc(dataset -> num_classes() * dataset -> num_classes(), sizeof(int)); // matrix size numberClasses x numberClasses
@@ -155,43 +138,27 @@ int main(int argc, char * argv[]) {
     int train_size = (int) train -> num_instances();
     int test_size = (int) test -> num_instances();
 
-    // train_size = 60;
-    // test_size = 8;
-
     printf("number of attributes: %d\n", num_attributes);
     printf("number of classes: %d\n", num_classes);
     printf("number of train instances: %d\n", train_size);
     printf("number of test instances: %d\n", test_size);
 
-    // printf("train 0, test 0, dist: %.2f\n", distance_cpu(train->get_instance(0), test->get_instance(0)));
-    // printf("train 0, test 1, dist: %.2f\n", distance_cpu(train->get_instance(0), test->get_instance(1)));
-    // printf("train 0, test 2, dist: %.2f\n", distance_cpu(train->get_instance(0), test->get_instance(2)));
-    // printf("train 0, test 3, dist: %.2f\n", distance_cpu(train->get_instance(0), test->get_instance(3)));
-    // printf("train 0, test 4, dist: %.2f\n", distance_cpu(train->get_instance(0), test->get_instance(4)));
-    // printf("train 0, test 5, dist: %.2f\n", distance_cpu(train->get_instance(0), test->get_instance(5)));
-    // printf("train 0, test 6, dist: %.2f\n", distance_cpu(train->get_instance(0), test->get_instance(6)));
-    // printf("train 0, test 7, dist: %.2f\n", distance_cpu(train->get_instance(0), test->get_instance(7)));
 
-    // Allocate and initialize host memory
-    float * h_train_instances = (float * ) malloc(train_size * num_attributes * sizeof(float));
-    for (int i = 0; i < train_size; i++) {
-        for (int j = 0; j < num_attributes; j++) {
-            h_train_instances[i * num_attributes + j] = train -> get_instance(i) -> get(j) -> operator float();
-        }
-    }
-
-    float * h_test_instances = (float * ) malloc(test_size * num_attributes * sizeof(float));
+    float * h_test_instances = (float * ) malloc((train_size + test_size) * num_attributes * sizeof(float));
     for (int i = 0; i < test_size; i++) {
         for (int j = 0; j < num_attributes; j++) {
             h_test_instances[i * num_attributes + j] = test -> get_instance(i) -> get(j) -> operator float();
         }
     }
+    for (int i = 0; i < train_size; i++) {
+        for (int j = 0; j < num_attributes; j++) {
+            h_test_instances[ (test_size + i) * num_attributes + j] = train -> get_instance(i) -> get(j) -> operator float();
+        }
+    }
 
     // Predictions is the array where you have to return the class predicted (integer) for the test dataset instances
     int * h_predictions = (int * ) malloc(test_size * sizeof(int));
-    for (int i = 0; i < test_size; i++) {
-        h_predictions[i] = INT_MAX;
-    }
+    memset(h_predictions, -1, sizeof(h_predictions));
 
     // Stores k-NN candidates for a query vector as a sorted 2d array. First element is inner product, second is class.
     float * h_candidates = (float * ) calloc(test_size * k * 2, sizeof(float));
@@ -202,14 +169,12 @@ int main(int argc, char * argv[]) {
     int * h_class_counts = (int * ) calloc(test_size * num_classes, sizeof(int));
 
     // Allocate device memory
-    float * d_train_instances;
     float * d_test_instances;
     int * d_predictions;
     float * d_candidates;
     int * d_class_counts;
 
-    cudaMalloc( & d_train_instances, train_size * num_attributes * sizeof(float));
-    cudaMalloc( & d_test_instances, test_size * num_attributes * sizeof(float));
+    cudaMalloc( & d_test_instances, (test_size + train_size) * num_attributes * sizeof(float));
     cudaMalloc( & d_predictions, test_size * sizeof(int));
     cudaMalloc( & d_candidates, test_size * k * 2 * sizeof(float));
     cudaMalloc( & d_class_counts, test_size * num_classes * sizeof(int));
@@ -221,42 +186,44 @@ int main(int argc, char * argv[]) {
 
 
     // Copy host memory to device memory
-    cudaMemcpy(d_train_instances, h_train_instances, train_size * num_attributes * sizeof(float), cudaMemcpyHostToDevice);
-    // cudaMemcpy(d_test_instances, h_test_instances, test_size * num_attributes * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_test_instances, h_test_instances, (test_size + train_size) * num_attributes * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_predictions, h_predictions, test_size * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_candidates, h_candidates, test_size * k * 2 * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_class_counts, h_class_counts, test_size * num_classes * sizeof(float), cudaMemcpyHostToDevice);
+
+    // create two dimensional blocks
+    dim3 blockSize;
+    blockSize.x = 4;
+    blockSize.y = 128;
+
+    // configure a two dimensional grid as well
+    dim3 gridSize;
+    gridSize.x = (test_size + blockSize.x - 1) / blockSize.x;
+    gridSize.y = (train_size + blockSize.y - 1) / blockSize.y;
 
 
 
     int numStreams = 2;
     cudaStream_t *streams = (cudaStream_t*) malloc (numStreams * sizeof(cudaStream_t));
+    int numberElementsPerStream = (test_size + numStreams - 1) / numStreams;
 
     for (int i = 0; i < numStreams; i++){
         cudaStreamCreate(&streams[i]);
     }
 
 
-    int numberElementsPerStream = (test_size + numStreams - 1) / numStreams;
-    // Configure the block and grid sizes
-    int blocksPerGrid = (numberElementsPerStream + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
 
     cudaEventRecord(start);
+    // Launch the kernel function
+
     for (int i = 0; i < numStreams; i++)
     {
         cudaMemcpyAsync(&d_test_instances[i*numberElementsPerStream * num_attributes], &h_test_instances[i*numberElementsPerStream * num_attributes], numberElementsPerStream * num_attributes * sizeof(float), cudaMemcpyHostToDevice, streams[i]);
-        // cudaMemcpyAsync(&d_predictions[i*numberElementsPerStream], &h_predictions[i*numberElementsPerStream], numberElementsPerStream * sizeof(int), cudaMemcpyHostToDevice, streams[i]);
-
-        KNN <<< blocksPerGrid, THREADS_PER_BLOCK, 0, streams[i] >>> (d_train_instances, d_test_instances, d_predictions, d_candidates, d_class_counts, train_size, test_size, k, num_attributes, num_classes, i, numberElementsPerStream);
-
-        // cudaMemcpyAsync(&h_predictions[i*numberElementsPerStream], &d_predictions[i*numberElementsPerStream], numberElementsPerStream * sizeof(int), cudaMemcpyDeviceToHost, streams[i]);
+        // KNN <<< blocksPerGrid, THREADS_PER_BLOCK, 0, streams[i] >>> (d_train_instances, d_test_instances, d_predictions, d_candidates, d_class_counts, train_size, test_size, k, num_attributes, num_classes, i, numberElementsPerStream);
+        KNN <<< gridSize, blockSize, 0, streams[i]  >>> (d_test_instances, d_predictions, d_candidates, d_class_counts, train_size, test_size, k, num_attributes, num_classes, i, numberElementsPerStream);
     }
-
     cudaDeviceSynchronize();
-
-
-    // // Launch the kernel function
-    // KNN <<< blocksPerGrid, THREADS_PER_BLOCK >>> (d_train_instances, d_test_instances, d_predictions, d_candidates, d_class_counts, train_size, test_size, k, num_attributes, num_classes);
+    KNN2 <<< gridSize, blockSize, 0 >>> (d_predictions, d_candidates, d_class_counts, test_size, k, num_classes);
 
     // Transfer device results to host memory
     cudaMemcpy(h_predictions, d_predictions, test_size * sizeof(int), cudaMemcpyDeviceToHost);
@@ -269,7 +236,6 @@ int main(int argc, char * argv[]) {
     }
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
-    
     float milliseconds = 0;
     cudaEventElapsedTime(&milliseconds, start, stop);
 
@@ -281,14 +247,12 @@ int main(int argc, char * argv[]) {
     printf("The %i-NN classifier for %d test instances on %d train instances required %f ms CPU time. Accuracy was %.2f%%\n", k, test_size, train_size, milliseconds, (accuracy * 100));
 
     // Free device global memory
-    cudaFree(d_train_instances);
     cudaFree(d_test_instances);
     cudaFree(d_predictions);
     cudaFree(d_candidates);
     cudaFree(d_class_counts);
 
     // Free host memory
-    free(h_train_instances);
     free(h_test_instances);
     free(h_predictions);
     free(h_candidates);

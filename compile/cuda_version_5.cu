@@ -15,7 +15,6 @@
 #define __shared__
 #endif
 
-#define THREADS_PER_BLOCK 128
 
 using namespace std;
 
@@ -34,37 +33,47 @@ __device__ float distance(float * a, int idx_a, int idx_b, int size) {
 }
 
 
-__global__ void KNN(float * test, int * predictions, float * candidates, int * classCounts, int train_size, int test_size, int k, int num_attributes, int num_classes) {
+__global__ void KNN(float * test, int * predictions, float * candidates, int * classCounts, int train_size, int test_size, int k, int num_attributes, int num_classes, int stream, int numberElementsPerStream) {
     // Implements a sequential kNN where for each candidate query an in-place priority queue is maintained to identify the kNN's.
 
-    int queryIndex = threadIdx.x + blockIdx.x * blockDim.x;
+// key = ID of training point
+// query = ID of test point
+    int queryIndex = stream * numberElementsPerStream + blockIdx.x * blockDim.x + threadIdx.x; 
+    int keyIndex = stream * numberElementsPerStream + blockIdx.y * blockDim.y + threadIdx.y; 
 
+    // printf("queryIndex: %d keyIndex: %d bidx: %d bidy: %d tidx: %d tidy: %d \n", queryIndex, keyIndex, blockIdx.x ,  blockIdx.y , threadIdx.x, threadIdx.y);
 
-    if (queryIndex < test_size) {
+    if (queryIndex < test_size && keyIndex < train_size) {
+
         int candidate_cuda_idx_buffer = queryIndex * 2 * k;
+        float dist = distance(test, queryIndex * num_attributes, num_attributes * test_size + keyIndex * num_attributes, num_attributes);
 
-        for (int keyIndex = 0; keyIndex < train_size; keyIndex ++) {
+        __syncthreads();
 
-            float dist = distance(test, queryIndex * num_attributes, num_attributes * test_size + keyIndex * num_attributes, num_attributes);
-            __syncthreads();
-
-
-            // Add to our candidates
-            for (int c = 0; c < k; c++) {
-                if (dist < candidates[candidate_cuda_idx_buffer + 2 * c]) {
-                    // Found a new candidate
-                    // Shift previous candidates down by one
-                    for (int x = k - 2; x >= c; x--) {
-                        candidates[candidate_cuda_idx_buffer + 2 * x + 2] = candidates[candidate_cuda_idx_buffer + 2 * x];
-                        candidates[candidate_cuda_idx_buffer + 2 * x + 3] = candidates[candidate_cuda_idx_buffer + 2 * x + 1];
-                    }
-                    // Set key vector as potential k NN
-                    candidates[candidate_cuda_idx_buffer + 2 * c] = dist;
-                    candidates[candidate_cuda_idx_buffer + 2 * c + 1] = test[num_attributes * test_size + keyIndex * num_attributes + num_attributes - 1]; // class value
-                    break;
+        // Add to our candidates
+        for (int c = 0; c < k; c++) {
+            if (dist < candidates[candidate_cuda_idx_buffer + 2 * c]) {
+                // Found a new candidate
+                // Shift previous candidates down by one
+                for (int x = k - 2; x >= c; x--) {
+                    candidates[candidate_cuda_idx_buffer + 2 * x + 2] = candidates[candidate_cuda_idx_buffer + 2 * x];
+                    candidates[candidate_cuda_idx_buffer + 2 * x + 3] = candidates[candidate_cuda_idx_buffer + 2 * x + 1];
                 }
+                // Set key vector as potential k NN
+                candidates[candidate_cuda_idx_buffer + 2 * c] = dist;
+                candidates[candidate_cuda_idx_buffer + 2 * c + 1] = test[num_attributes * test_size + keyIndex * num_attributes + num_attributes - 1]; // class value
+                break;
             }
         }
+    }
+}
+
+__global__ void KNN2(int * predictions, float * candidates, int * classCounts, int test_size, int k, int num_classes) {
+    // Implements a sequential kNN where for each candidate query an in-place priority queue is maintained to identify the kNN's.
+    int queryIndex = blockIdx.x * blockDim.x + threadIdx.x; // ID of test point
+    if (queryIndex < test_size) {
+        __syncthreads();
+        int candidate_cuda_idx_buffer = queryIndex * 2 * k;
 
         int cuda_idx_buffer = queryIndex * num_classes;
 
@@ -84,6 +93,7 @@ __global__ void KNN(float * test, int * predictions, float * candidates, int * c
         predictions[queryIndex] = max_index;
     }
 }
+
 
 int * computeConfusionMatrix(int * predictions, ArffData * dataset) {
     int * confusionMatrix = (int * ) calloc(dataset -> num_classes() * dataset -> num_classes(), sizeof(int)); // matrix size numberClasses x numberClasses
@@ -148,6 +158,7 @@ int main(int argc, char * argv[]) {
 
     // Predictions is the array where you have to return the class predicted (integer) for the test dataset instances
     int * h_predictions = (int * ) malloc(test_size * sizeof(int));
+    memset(h_predictions, -1, sizeof(h_predictions));
 
     // Stores k-NN candidates for a query vector as a sorted 2d array. First element is inner product, second is class.
     float * h_candidates = (float * ) calloc(test_size * k * 2, sizeof(float));
@@ -180,12 +191,39 @@ int main(int argc, char * argv[]) {
     cudaMemcpy(d_candidates, h_candidates, test_size * k * 2 * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_class_counts, h_class_counts, test_size * num_classes * sizeof(float), cudaMemcpyHostToDevice);
 
-    // Configure the block and grid sizes
-    int blocksPerGrid = (test_size + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    // create two dimensional blocks
+    dim3 blockSize;
+    blockSize.x = 4;
+    blockSize.y = 128;
+
+    // configure a two dimensional grid as well
+    dim3 gridSize;
+    gridSize.x = (test_size + blockSize.x - 1) / blockSize.x;
+    gridSize.y = (train_size + blockSize.y - 1) / blockSize.y;
+
+
+
+    int numStreams = 2;
+    cudaStream_t *streams = (cudaStream_t*) malloc (numStreams * sizeof(cudaStream_t));
+    int numberElementsPerStream = (test_size + numStreams - 1) / numStreams;
+
+    for (int i = 0; i < numStreams; i++){
+        cudaStreamCreate(&streams[i]);
+    }
+
+
 
     cudaEventRecord(start);
     // Launch the kernel function
-    KNN <<< blocksPerGrid, THREADS_PER_BLOCK >>> (d_test_instances, d_predictions, d_candidates, d_class_counts, train_size, test_size, k, num_attributes, num_classes);
+
+    for (int i = 0; i < numStreams; i++)
+    {
+        cudaMemcpyAsync(&d_test_instances[i*numberElementsPerStream * num_attributes], &h_test_instances[i*numberElementsPerStream * num_attributes], numberElementsPerStream * num_attributes * sizeof(float), cudaMemcpyHostToDevice, streams[i]);
+        // KNN <<< blocksPerGrid, THREADS_PER_BLOCK, 0, streams[i] >>> (d_train_instances, d_test_instances, d_predictions, d_candidates, d_class_counts, train_size, test_size, k, num_attributes, num_classes, i, numberElementsPerStream);
+        KNN <<< gridSize, blockSize, 0, streams[i]  >>> (d_test_instances, d_predictions, d_candidates, d_class_counts, train_size, test_size, k, num_attributes, num_classes, i, numberElementsPerStream);
+    }
+    cudaDeviceSynchronize();
+    KNN2 <<< gridSize, blockSize, 0 >>> (d_predictions, d_candidates, d_class_counts, test_size, k, num_classes);
 
     // Transfer device results to host memory
     cudaMemcpy(h_predictions, d_predictions, test_size * sizeof(int), cudaMemcpyDeviceToHost);
